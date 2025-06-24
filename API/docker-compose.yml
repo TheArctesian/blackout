@@ -1,0 +1,12 @@
+version: '3'
+
+services:
+  flask-redactor:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./redacted:/app/redacted
+      - ./.env:/app/.env
+    restart: unless-stopped
