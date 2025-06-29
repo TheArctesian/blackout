@@ -35,11 +35,12 @@ CALIFORNIA_CODES = {
     "HSC_123100": "California Health and Safety Code § 123100 - Medical information confidentiality",
     "CCPA": "California Consumer Privacy Act - Protection of personal information",
     "GOV_6254": "California Government Code § 6254 - Exemptions from public records disclosure",
+    "GLBA": "Gramm-Leach-Bliley Act - Protection of financial information",
 }
 
 
 class CaliforniaRedactor:
-    def __init__(self):  # Fixed: Changed init to __init__
+    def __init__(self):
         # Patterns for California-specific redactions with legal citations
         self.patterns = {
             "ssn": {
@@ -77,17 +78,57 @@ class CaliforniaRedactor:
                 "citation": "GOV_6254",
                 "reason": "Full dates of birth are exempt from disclosure",
             },
-            "financial_statments": {
-                "pattern": r"\$\ *\d*\,\d*",
-                "citation": "Financial Redactions",
-                "reason": "Hide Financial Numbers from public documents",
+            # Added financial statement patterns
+            "account_number": {
+                "pattern": r"\bAcct\.?\s?#?\s?\d{4,}|\bAccount\s?#?\s?\d{4,}",
+                "citation": "GLBA",
+                "reason": "Financial account numbers are protected under GLBA and CCPA",
             },
-            "financial_statment": {
-                "pattern": r"\$\ *\d*\,\d*,\d*",
-                "citation": "financial Redactions",
-                "reason": "Hide Financial Numbers from public documents",
+            "routing_number": {
+                "pattern": r"\brouting\s?#?\s?\d{9}\b|\bABA\s?#?\s?\d{9}\b",
+                "citation": "GLBA",
+                "reason": "Bank routing numbers are protected financial information",
+            },
+            "financial_balance": {
+                "pattern": r"\bbalance[:of]*\s?\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b|\btotal\s?balance[:of]*\s?\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b",
+                "citation": "GLBA",
+                "reason": "Account balances are protected financial information",
+            },
+            "dollar_amounts": {
+                "pattern": r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\b\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:dollars|USD)\b",
+                "citation": "GLBA",
+                "reason": "Specific dollar amounts in financial context require protection",
+            },
+            "investment_account": {
+                "pattern": r"\b(?:investment|brokerage|retirement|IRA|401k|403b)\s?(?:account|acct)?\s?#?\s?\d+\b",
+                "citation": "GLBA",
+                "reason": "Investment account information requires protection",
+            },
+            "financial_statement": {
+                "pattern": r"\b(?:bank|financial|account|credit card)\s?statement\b",
+                "citation": "GLBA",
+                "reason": "Financial statements contain protected information",
+            },
+            "transaction_details": {
+                "pattern": r"\b(?:transaction|payment|deposit|withdrawal)\s?#?\s?\d+\b",
+                "citation": "GLBA",
+                "reason": "Transaction details are protected financial information",
             },
         }
+
+        # Add patterns to identify financial statement sections
+        self.financial_section_patterns = [
+            r"(?:STATEMENT\s?OF\s?(?:FINANCIAL\s?POSITION|INCOME|CASH\s?FLOWS))",
+            r"(?:BALANCE\s?SHEET)",
+            r"(?:INCOME\s?STATEMENT)",
+            r"(?:CASH\s?FLOW\s?STATEMENT)",
+            r"(?:FINANCIAL\s?SUMMARY)",
+            r"(?:ACCOUNT\s?SUMMARY)",
+            r"(?:TRANSACTION\s?HISTORY)",
+            r"(?:QUARTERLY\s?STATEMENT)",
+            r"(?:ANNUAL\s?STATEMENT)",
+            r"(?:BANK\s?STATEMENT)",
+        ]
 
     def extract_text_with_positions(self, pdf_path):
         """Extract text with position information from PDF"""
@@ -163,6 +204,38 @@ class CaliforniaRedactor:
                     }
                 )
 
+        # Identify financial statement sections
+        for pattern in self.financial_section_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                match_start = match.start()
+                match_end = match.end()
+                matched_text = match.group()
+
+                # Find corresponding position info
+                bbox_list = []
+                page_num = None
+
+                for pos in text_positions:
+                    if pos["start"] <= match_start < pos["end"]:
+                        if page_num is None:
+                            page_num = pos["page"]
+                        if pos["page"] == page_num:
+                            bbox_list.append(pos["bbox"])
+
+                redactions.append(
+                    {
+                        "type": "financial_section",
+                        "text": matched_text,
+                        "start": match_start,
+                        "end": match_end,
+                        "page": page_num,
+                        "bbox": bbox_list,
+                        "citation": CALIFORNIA_CODES["GLBA"],
+                        "reason": "Financial statement sections contain protected information under GLBA",
+                        "legal_code": "GLBA",
+                    }
+                )
+
         return redactions
 
     def find_sensitive_info_with_llm(self, text):
@@ -182,20 +255,21 @@ class CaliforniaRedactor:
             - Confidential informant identities (Penal Code § 841.5)
             - Medical/psychological information (Health & Safety Code § 123100)
             - Witness home addresses in criminal cases (Government Code § 6254)
-            
-            In addition return any financial statments with dollar amounts.
+            - Financial information including account numbers, balances, transactions (Gramm-Leach-Bliley Act, CCPA)
+            - Financial statements and detailed financial data (Gramm-Leach-Bliley Act)
+    
             Return your response as a JSON array with objects containing:
             {{"text": "exact text to redact", "code": "legal code reference", "reason": "brief explanation"}}
     
             Document excerpt:
-            {text[:4000]}
+            {text[:1000]}
             """
 
             response = openai.ChatCompletion.create(
                 model="gpt-4",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=8000,
+                max_tokens=7100,
             )
 
             # Parse LLM response
@@ -231,6 +305,88 @@ class CaliforniaRedactor:
             print(f"LLM error: {e}")
             return []
 
+    def find_financial_tables(self, pdf_path, page_data):
+        """Identify financial tables in the document using layout analysis"""
+        financial_table_redactions = []
+        doc = fitz.open(pdf_path)
+
+        for page_info in page_data:
+            page_num = page_info["page_num"]
+            page = doc[page_num]
+
+            # Extract tables
+            tables = page.find_tables()
+            if tables and tables.tables:
+                for table in tables.tables:
+                    # Check if this appears to be a financial table
+                    cells = table.extract()
+                    header_row = cells[0] if cells else []
+
+                    # Look for financial keywords in header
+                    financial_keywords = [
+                        "amount",
+                        "balance",
+                        "total",
+                        "payment",
+                        "transaction",
+                        "debit",
+                        "credit",
+                        "deposit",
+                        "withdrawal",
+                        "date",
+                        "description",
+                        "account",
+                        "$",
+                        "usd",
+                        "dollars",
+                    ]
+
+                    is_financial_table = False
+                    # Check headers for financial terms
+                    for cell in header_row:
+                        if any(
+                            keyword.lower() in cell.lower()
+                            for keyword in financial_keywords
+                        ):
+                            is_financial_table = True
+                            break
+
+                    # If not found in headers, check first column for dates
+                    if not is_financial_table and len(cells) > 1:
+                        date_pattern = r"\d{1,2}/\d{1,2}/\d{2,4}"
+                        first_column = [row[0] for row in cells[1:] if row]
+                        date_matches = [
+                            re.search(date_pattern, cell)
+                            for cell in first_column
+                            if cell
+                        ]
+                        if any(date_matches):
+                            # Check if any row has dollar amounts
+                            for row in cells[1:]:
+                                if any(
+                                    re.search(r"\$\s?\d+", cell) for cell in row if cell
+                                ):
+                                    is_financial_table = True
+                                    break
+
+                    if is_financial_table:
+                        # Create a redaction for the entire table
+                        rect = fitz.Rect(table.bbox)
+                        financial_table_redactions.append(
+                            {
+                                "type": "financial_table",
+                                "text": "Financial Table",
+                                "page": page_num,
+                                "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
+                                "citation": CALIFORNIA_CODES["GLBA"],
+                                "reason": "Financial tables contain protected information under GLBA",
+                                "legal_code": "GLBA",
+                            }
+                        )
+
+        doc.close()
+        return financial_table_redactions
+
     def create_redacted_pdf_with_metadata(self, input_path, output_path, redactions):
         """Create a new PDF with redactions and return metadata"""
         doc = fitz.open(input_path)
@@ -240,25 +396,46 @@ class CaliforniaRedactor:
             page_redactions = [r for r in redactions if r.get("page") == page_num]
 
             for redaction in page_redactions:
-                search_text = redaction["text"]
-                text_instances = page.search_for(search_text)
+                # Handle text redactions
+                if "text" in redaction and redaction["text"] != "Financial Table":
+                    search_text = redaction["text"]
+                    text_instances = page.search_for(search_text)
 
-                for inst in text_instances:
-                    # Add redaction annotation with black box character
-                    annot = page.add_redact_annot(inst)
-                    # Set redaction text to be filled with ■ characters
-                    redaction_length = len(search_text)
-                    replacement_text = "■" * redaction_length
-                    annot.set_text(replacement_text)
+                    for inst in text_instances:
+                        # Add redaction annotation with black box character
+                        annot = page.add_redact_annot(inst)
+                        # Set redaction text to be filled with ■ characters
+                        redaction_length = len(search_text)
+                        replacement_text = "■" * redaction_length
+                        annot.set_text(replacement_text)
 
-                    # Store metadata
+                        # Store metadata
+                        redaction_metadata.append(
+                            {
+                                "id": f"redaction_{page_num}_{len(redaction_metadata)}",
+                                "page": page_num,
+                                "text": search_text,
+                                "bbox": [inst.x0, inst.y0, inst.x1, inst.y1],
+                                "type": redaction["type"],
+                                "citation": redaction.get("citation", ""),
+                                "reason": redaction.get("reason", ""),
+                                "legal_code": redaction.get("legal_code", ""),
+                                "applied": True,
+                            }
+                        )
+                # Handle financial table redactions
+                elif redaction.get("type") == "financial_table":
+                    bbox = fitz.Rect(redaction["bbox"])
+                    annot = page.add_redact_annot(bbox)
+                    annot.set_text("■ FINANCIAL DATA REDACTED ■")
+
                     redaction_metadata.append(
                         {
                             "id": f"redaction_{page_num}_{len(redaction_metadata)}",
                             "page": page_num,
-                            "text": search_text,
-                            "bbox": [inst.x0, inst.y0, inst.x1, inst.y1],
-                            "type": redaction["type"],
+                            "text": "Financial Table",
+                            "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                            "type": "financial_table",
                             "citation": redaction.get("citation", ""),
                             "reason": redaction.get("reason", ""),
                             "legal_code": redaction.get("legal_code", ""),
@@ -284,21 +461,29 @@ class CaliforniaRedactor:
         # Find patterns to redact
         pattern_redactions = self.find_patterns_to_redact(full_text, text_positions)
 
+        # Find financial tables
+        financial_table_redactions = self.find_financial_tables(pdf_path, page_data)
+
         # Use LLM for additional redactions
         llm_redactions = self.find_sensitive_info_with_llm(full_text)
 
         # Combine all redactions
-        all_redactions = pattern_redactions + llm_redactions
-        print(all_redactions)
+        all_redactions = (
+            pattern_redactions + llm_redactions + financial_table_redactions
+        )
 
         # Remove duplicates
         unique_redactions = []
         seen = set()
         for r in all_redactions:
-            key = (r["start"], r["end"])
-            if key not in seen:
-                seen.add(key)
+            if r.get("type") == "financial_table":
+                # Don't deduplicate financial tables
                 unique_redactions.append(r)
+            else:
+                key = (r.get("start", 0), r.get("end", 0))
+                if key not in seen:
+                    seen.add(key)
+                    unique_redactions.append(r)
 
         # Create redacted PDF and get metadata
         output_path = pdf_path.replace(".pdf", "_redacted.pdf")
@@ -378,19 +563,22 @@ def apply_redactions():
         doc = fitz.open(temp_path)
 
         for redaction in redactions:
-            print(redaction)
             if redaction.get("applied", True):
                 page = doc[redaction["page"]]
                 bbox = fitz.Rect(redaction["bbox"])
                 annot = page.add_redact_annot(bbox)
 
                 # Replace with ■ characters
-                text_length = int(
-                    (bbox[2] - bbox[0]) / 5
-                )  # Estimate number of characters
-                if text_length < 1:
-                    text_length = 1
-                replacement_text = "■" * text_length
+                if redaction.get("type") == "financial_table":
+                    replacement_text = "■ FINANCIAL DATA REDACTED ■"
+                else:
+                    text_length = int(
+                        (bbox[2] - bbox[0]) / 5
+                    )  # Estimate number of characters
+                    if text_length < 1:
+                        text_length = 1
+                    replacement_text = "■" * text_length
+
                 annot.set_text(replacement_text)
 
         # Apply all redactions
